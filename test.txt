@@ -1,0 +1,318 @@
+import json
+import datetime as dt
+from dataclasses import dataclass
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import gradio as gr
+
+PRODUCTS = ["CA","SA","TD","DLP","DCD"]
+
+# ---------- util ----------
+def eom(d: dt.date) -> dt.date:
+    ts = pd.Timestamp(d)
+    return (ts + pd.offsets.MonthEnd(0)).date()
+
+def add_m(d: dt.date, m: int) -> dt.date:
+    return (pd.Timestamp(d) + pd.offsets.MonthEnd(m)).date()
+
+# ---------- paramy ----------
+@dataclass
+class Params:
+    horizon: int = 12
+    ca_growth: float = 0.002
+    sa_growth: float = 0.001
+    td_auto_renew: float = 0.85
+    td_manual_renew: float = 0.60
+    dlp_auto_renew: float = 0.70
+    dlp_manual_renew: float = 0.40
+    dcd_auto_renew: float = 0.65
+    dcd_manual_renew: float = 0.35
+    leakage_to_ca: float = 0.60
+    ftp: dict = None
+    offered: dict = None
+    def __post_init__(self):
+        if self.ftp is None:
+            self.ftp = {"TD":0.045,"DLP":0.040,"DCD":0.040,"CA":0.020,"SA":0.025}
+        if self.offered is None:
+            self.offered = {"TD":0.030,"DLP":0.025,"DCD":0.020,"CA":0.000,"SA":0.010}
+
+
+
+
+
+
+def sample_history() -> pd.DataFrame:
+    start = eom(dt.date(2024,12,31))
+    months = [add_m(start, i) for i in range(0, 8)]  # 8 m-cy historii
+    base = {"CA": 33.0, "SA": 12.7, "TD": 27.4, "DLP": 0.75, "DCD": 0.55}
+    rows = []
+    for i, m in enumerate(months):
+        drift = {
+            "CA": base["CA"]*(1+0.002*i),
+            "SA": base["SA"]*(1+0.001*i),
+            "TD": base["TD"]*(1-0.002*i) + (1 if i in (2,5) else 0),
+            "DLP": base["DLP"]*(1+0.01*(i%3==0)),
+            "DCD": base["DCD"]*(1+0.005*(i%2==0)),
+        }
+        for p in PRODUCTS:
+            rows.append({"data_eom": m, "product": p, "balance_pln": drift[p]*1e9})
+    return pd.DataFrame(rows)
+
+def sample_retention() -> pd.DataFrame:
+    hist = sample_history()
+    last = hist["data_eom"].max()
+    months = [add_m(last, i) for i in range(1, 7)]
+    data = []
+    for m in months:
+        data += [
+            {"maturity_date": m, "product": "TD",  "amount_pln": 1.2e9, "auto_renew": 1, "offered_rate": 0.028},
+            {"maturity_date": m, "product": "TD",  "amount_pln": 0.8e9, "auto_renew": 0, "offered_rate": 0.028},
+            {"maturity_date": m, "product": "DLP", "amount_pln": 0.10e9, "auto_renew": 1, "offered_rate": 0.022},
+            {"maturity_date": m, "product": "DLP", "amount_pln": 0.05e9, "auto_renew": 0, "offered_rate": 0.022},
+            {"maturity_date": m, "product": "DCD", "amount_pln": 0.08e9, "auto_renew": 1, "offered_rate": 0.020},
+            {"maturity_date": m, "product": "DCD", "amount_pln": 0.04e9, "auto_renew": 0, "offered_rate": 0.020},
+        ]
+    df = pd.DataFrame(data)
+    df["maturity_date"] = pd.to_datetime(df["maturity_date"]).dt.date
+    return df
+
+def sample_new_money() -> pd.DataFrame:
+    hist = sample_history()
+    last = hist["data_eom"].max()
+    months = [add_m(last, i) for i in range(1, 7)]
+    rows = []
+    for m in months:
+        rows += [
+            {"eom": m, "product": "TD",  "amount_pln": 0.35e9},
+            {"eom": m, "product": "SA",  "amount_pln": 0.18e9},
+            {"eom": m, "product": "CA",  "amount_pln": 0.10e9},
+        ]
+    return pd.DataFrame(rows)
+
+def sample_one_offs() -> pd.DataFrame:
+    hist = sample_history()
+    last = hist["data_eom"].max()
+    rows = [
+        {"eom": add_m(last, 2), "product": "TD", "amount_pln": -0.3e9, "note": "duża lokata odchodzi"},
+        {"eom": add_m(last, 3), "product": "SA", "amount_pln":  0.2e9, "note": "przedłużenie promo SA"},
+    ]
+    return pd.DataFrame(rows)
+
+def sample_budget_total() -> pd.DataFrame:
+    hist = sample_history()
+    last = hist["data_eom"].max()
+    months = [add_m(last, i) for i in range(1, 13)]
+    base_total = hist.groupby("data_eom")["balance_pln"].sum().iloc[-1]/1e9
+    vals = [base_total*(1+0.002*i) for i in range(1, 13)]
+    return pd.DataFrame({"eom": months, "total": [v*1e9 for v in vals]})
+
+
+
+
+def build_base_from_last_eom(eom_bal: pd.DataFrame) -> dict:
+    last = eom_bal["data_eom"].max()
+    base = eom_bal[eom_bal["data_eom"]==last].groupby("product")["balance_pln"].sum().reindex(PRODUCTS).fillna(0.0).to_dict()
+    base["RB"] = sum(base.values())
+    return base
+
+def apply_growth(bal: dict, ca_g: float, sa_g: float) -> dict:
+    b = bal.copy()
+    b["CA"] = b.get("CA",0.0)*(1+ca_g)
+    b["SA"] = b.get("SA",0.0)*(1+sa_g)
+    return b
+
+def apply_retention_month(bal: dict, month: dt.date, ret_df: pd.DataFrame,
+                          rr_auto: dict, rr_man: dict, leakage_to_ca: float) -> dict:
+    b = bal.copy()
+    if ret_df.empty: return b
+    mret = ret_df.copy()
+    mret["eom"] = pd.to_datetime(mret["maturity_date"]).dt.to_period("M").dt.to_timestamp("M").dt.date
+    mret = mret[mret["eom"]==month]
+    for prod in ["TD","DLP","DCD"]:
+        sub = mret[mret["product"]==prod]
+        if sub.empty: continue
+        total = float(sub["amount_pln"].sum())
+        auto_amt = float(sub.loc[sub["auto_renew"].astype(float)>0, "amount_pln"].sum())
+        manual_amt = total - auto_amt
+        renew = auto_amt*rr_auto[prod] + manual_amt*rr_man[prod]
+        out = total - renew
+        b[prod] = b.get(prod,0.0) - total + renew
+        leak_ca = out*leakage_to_ca
+        b["CA"] = b.get("CA",0.0) + leak_ca
+        b["SA"] = b.get("SA",0.0) + (out - leak_ca)
+    return b
+
+def apply_new_money_month(bal: dict, month: dt.date, new_df: pd.DataFrame) -> dict:
+    b = bal.copy()
+    if new_df.empty: return b
+    add = new_df[new_df["eom"]==month].groupby("product")["amount_pln"].sum()
+    for p,v in add.items():
+        if p in PRODUCTS:
+            b[p] = b.get(p,0.0) + float(v)
+    return b
+
+def apply_one_offs_month(bal: dict, month: dt.date, oo_df: pd.DataFrame) -> dict:
+    b = bal.copy()
+    if oo_df.empty: return b
+    adj = oo_df[oo_df["eom"]==month].groupby("product")["amount_pln"].sum()
+    for p,v in adj.items():
+        if p in PRODUCTS:
+            b[p] = b.get(p,0.0) + float(v)
+    return b
+
+def monthly_nii(bal: dict, ftp: dict, offered: dict) -> dict:
+    out = {}
+    for p in PRODUCTS:
+        out[p] = float(bal.get(p,0.0))*(ftp.get(p,0.0)-offered.get(p,0.0))/12.0
+    out["RB"] = sum(out[p] for p in PRODUCTS)
+    return out
+
+def forecast_pipeline(eom_bal: pd.DataFrame, ret: pd.DataFrame, new_money: pd.DataFrame, one_offs: pd.DataFrame, params: Params):
+    last = eom_bal["data_eom"].max()
+    hist_df = eom_bal.copy()
+
+    base = build_base_from_last_eom(eom_bal)
+    months = [add_m(last, i) for i in range(1, params.horizon+1)]
+    rr_auto = {"TD":params.td_auto_renew, "DLP":params.dlp_auto_renew, "DCD":params.dcd_auto_renew}
+    rr_man  = {"TD":params.td_manual_renew,"DLP":params.dlp_manual_renew,"DCD":params.dcd_manual_renew}
+
+    bal = base.copy()
+    rec_fc, rec_nii = [], []
+    for m in months:
+        bal = apply_growth(bal, params.ca_growth, params.sa_growth)
+        bal = apply_retention_month(bal, m, ret, rr_auto, rr_man, params.leakage_to_ca)
+        bal = apply_new_money_month(bal, m, new_money)
+        bal = apply_one_offs_month(bal, m, one_offs)
+        for p in PRODUCTS:
+            rec_fc.append({"eom": m, "product": p, "balance_pln": float(bal.get(p,0.0))})
+        nii = monthly_nii(bal, params.ftp, params.offered)
+        for p in PRODUCTS:
+            rec_nii.append({"eom": m, "product": p, "nii_pln": float(nii[p])})
+    return hist_df, pd.DataFrame(rec_fc), pd.DataFrame(rec_nii)
+
+
+
+def chart_current(hist_df: pd.DataFrame):
+    last = hist_df["data_eom"].max()
+    cur = hist_df[hist_df["data_eom"]==last].groupby("product")["balance_pln"].sum().reindex(PRODUCTS).fillna(0).reset_index()
+    cur.columns = ["product","balance_pln"]
+    fig = px.bar(cur, x="product", y="balance_pln", title=f"Stan bieżący (EOM {last})")
+    fig.update_yaxes(title="Saldo [PLN]")
+    return fig
+
+def chart_history(hist_df: pd.DataFrame):
+    fig = px.line(hist_df, x="data_eom", y="balance_pln", color="product", markers=True, title="Historia (EOM)")
+    fig.update_yaxes(title="Saldo [PLN]")
+    return fig
+
+def chart_volume(hist_df: pd.DataFrame, fc_df: pd.DataFrame, budget: pd.DataFrame):
+    h_tot = hist_df.groupby("data_eom")["balance_pln"].sum().reset_index().rename(columns={"data_eom":"eom"})
+    f_tot = fc_df.groupby("eom")["balance_pln"].sum().reset_index()
+    fig = go.Figure()
+    fig.add_bar(x=h_tot["eom"], y=h_tot["balance_pln"], name="Realisation")
+    fig.add_bar(x=f_tot["eom"], y=f_tot["balance_pln"], name="Forecast", opacity=0.65)
+    if not budget.empty:
+        b = budget.sort_values("eom")
+        fig.add_scatter(x=b["eom"], y=b["total"], name="BUDGET", mode="lines")
+    fig.update_layout(title="Deposit vol forecast [B PLN, basic scenario]", barmode="group")
+    fig.update_yaxes(title="Saldo [PLN]")
+    return fig
+
+def chart_nii(nii_df: pd.DataFrame):
+    t = nii_df.groupby("eom")["nii_pln"].sum().reset_index()
+    fig = go.Figure()
+    fig.add_bar(x=t["eom"], y=t["nii_pln"], name="Forecast")
+    fig.update_layout(title="Deposit NII forecast [M PLN, basic scenario]")
+    fig.update_yaxes(title="NII [PLN/mies.]")
+    return fig
+
+
+
+
+def run_demo(horizon, ca_g, sa_g,
+             td_auto, td_man, dlp_auto, dlp_man, dcd_auto, dcd_man,
+             leak_ca, ftp_json, offered_json):
+
+    hist = sample_history()
+    ret  = sample_retention()
+    newm = sample_new_money()
+    oneo = sample_one_offs()
+    budg = sample_budget_total()
+
+    p = Params(
+        horizon=int(horizon),
+        ca_growth=float(ca_g), sa_growth=float(sa_g),
+        td_auto_renew=float(td_auto), td_manual_renew=float(td_man),
+        dlp_auto_renew=float(dlp_auto), dlp_manual_renew=float(dlp_man),
+        dcd_auto_renew=float(dcd_auto), dcd_manual_renew=float(dcd_man),
+        leakage_to_ca=float(leak_ca)
+    )
+    # bezpieczne parsowanie JSON (po prostu ignoruj błędy)
+    try:
+        if ftp_json and str(ftp_json).strip():
+            p.ftp.update(json.loads(str(ftp_json)))
+    except Exception:
+        pass
+    try:
+        if offered_json and str(offered_json).strip():
+            p.offered.update(json.loads(str(offered_json)))
+    except Exception:
+        pass
+
+    hist_df, fc_df, nii_df = forecast_pipeline(hist, ret, newm, oneo, p)
+    return (
+        chart_current(hist_df),
+        chart_history(hist_df),
+        chart_volume(hist_df, fc_df, budg),
+        chart_nii(nii_df),
+        hist_df, fc_df, nii_df, ret, newm, oneo, budg
+    )
+
+# — konstrukcja UI (jako funkcja, żeby łatwo restartować w notatniku)
+def make_demo():
+    with gr.Blocks(title="Deposits DEMO (offline)") as demo:
+        gr.Markdown("## 🧪 DEMO — Deposits & NII (bez źródeł, dane na twardo)")
+        with gr.Row():
+            horizon = gr.Slider(1, 18, value=12, step=1, label="Horyzont (mies.)")
+            ca_g = gr.Number(value=0.002, label="CA growth m/m")
+            sa_g = gr.Number(value=0.001, label="SA growth m/m")
+            td_auto = gr.Number(value=0.85, label="TD auto-renew")
+            td_man  = gr.Number(value=0.60, label="TD manual-renew")
+            dlp_auto= gr.Number(value=0.70, label="DLP auto-renew")
+            dlp_man = gr.Number(value=0.40, label="DLP manual-renew")
+            dcd_auto= gr.Number(value=0.65, label="DCD auto-renew")
+            dcd_man = gr.Number(value=0.35, label="DCD manual-renew")
+            leak_ca = gr.Number(value=0.60, label="Leakage → CA")
+        with gr.Row():
+            ftp_json = gr.Textbox(label="FTP (JSON, opcjonalnie)", placeholder='{"TD":0.045,"SA":0.025,"CA":0.020}')
+            offered_json = gr.Textbox(label="Offered (JSON, opcjonalnie)", placeholder='{"TD":0.030,"SA":0.010,"CA":0.000}')
+
+        run_btn = gr.Button("RUN DEMO")
+
+        with gr.Tab("Stan bieżący"):
+            fig_cur = gr.Plot()
+        with gr.Tab("Historia"):
+            fig_hist = gr.Plot()
+        with gr.Tab("Forecast — Volume"):
+            fig_vol = gr.Plot()
+        with gr.Tab("Forecast — NII"):
+            fig_nii = gr.Plot()
+        with gr.Tab("Podgląd danych (DEMO)"):
+            grid_hist = gr.Dataframe(interactive=False)
+            grid_fc   = gr.Dataframe(interactive=False)
+            grid_nii  = gr.Dataframe(interactive=False)
+            grid_ret  = gr.Dataframe(interactive=False)
+            grid_new  = gr.Dataframe(interactive=False)
+            grid_oo   = gr.Dataframe(interactive=False)
+            grid_bdg  = gr.Dataframe(interactive=False)
+
+        run_btn.click(
+            run_demo,
+            inputs=[horizon, ca_g, sa_g,
+                    td_auto, td_man, dlp_auto, dlp_man, dcd_auto, dcd_man,
+                    leak_ca, ftp_json, offered_json],
+            outputs=[fig_cur, fig_hist, fig_vol, fig_nii,
+                     grid_hist, grid_fc, grid_nii, grid_ret, grid_new, grid_oo, grid_bdg]
+        )
+    return demo
